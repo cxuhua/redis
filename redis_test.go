@@ -4,21 +4,26 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-var client *Client
-
 var (
-	testHost string
-	testPort uint
+	testHost    string
+	testAddress string
+	testPort    uint
+)
+
+const (
+	testProto = `tcp`
 )
 
 func init() {
 	// Getting host and port from command line.
-
-	host := flag.String("host", "127.0.0.1", "Test hostname or address.")
+	host := flag.String("host", "10.1.2.201", "Test hostname or address.")
 	port := flag.Uint("port", 6379, "Port.")
 
 	flag.Parse()
@@ -26,124 +31,112 @@ func init() {
 	testHost = *host
 	testPort = *port
 
+	testAddress = fmt.Sprintf("%s:%d", testHost, testPort)
+
 	log.Printf("Running tests against host %s:%d.\n", testHost, testPort)
 }
 
 func TestConnect(t *testing.T) {
 	var err error
+	var client *Client
 
 	client = New()
 
-	// Attempting a valid connection.
-	err = client.Connect(testHost, testPort)
-	if err != nil {
-		t.Fatalf("Failed to connect to test server: %v", err)
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
 	}
 
-	// Attempting to connect to port 0, probably closed...
-	err = client.Connect(testHost, 0)
-	if err == nil {
-		t.Fatalf("Expecting a connection error.")
+	if err = client.Close(); err != nil {
+		t.Fatalf("Client should be able to close the connection.")
+	}
+
+	if err = client.Connect(testHost, 0); err == nil {
+		t.Fatalf("Client should not be able to connect to a unused port.")
+	}
+
+	if err = client.Close(); err != nil {
+		t.Fatalf("Client should be able to close the connection.")
 	}
 }
 
 func TestPing(t *testing.T) {
 	var s string
 	var err error
+	var client *Client
 
 	client = New()
 
-	err = client.ConnectWithTimeout(testHost, testPort, time.Second*1)
-
-	if err != nil {
-		t.Fatalf(err.Error())
+	if err = client.ConnectWithTimeout(testHost, testPort, 0); err != nil {
+		t.Fatalf("Client failed to connect and set a timeout: %q", err)
 	}
 
-	s, err = client.Ping()
+	defer client.Close()
 
-	if err != nil {
-		t.Fatalf("Command failed: %v", err)
-	}
-
-	if s != "PONG" {
-		t.Fatalf("Failed")
-	}
-
-	client.Quit()
-}
-
-func TestPingAsync(t *testing.T) {
-	var s string
-	var err error
-
-	client = New()
-
-	err = client.ConnectNonBlock(testHost, testPort)
-
-	if err != nil {
-		t.Fatalf(err.Error())
-	}
-
-	s, err = client.Ping()
-
-	if err != nil {
-		t.Fatalf("Command failed: %v", err)
+	if s, err = client.Ping(); err != nil {
+		t.Fatalf("Command PING failed: %q", err)
 	}
 
 	if s != "PONG" {
-		t.Fatalf("Failed")
+		t.Fatal("Expecting PONG reply.")
 	}
 
 	client.Quit()
-
 }
 
 func TestSimpleSet(t *testing.T) {
 	var s string
 	var b bool
 	var err error
+	var client *Client
 
-	// We'll be reusing this client.
-	err = client.Connect(testHost, testPort)
+	client = New()
 
-	if err != nil {
-		t.Fatalf(err.Error())
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatal(err)
 	}
 
-	s, err = client.Set("foo", "hello world.")
+	defer client.Close()
 
-	if err != nil {
-		t.Fatalf("Command failed: %s", err.Error())
+	if s, err = client.Set("foo", "hello world."); err != nil {
+		t.Fatalf("Command SET failed: %q", err)
 	}
 
 	if s != "OK" {
-		t.Fatalf("Failed")
+		t.Fatal("Expecting OK response.")
 	}
 
-	b, err = client.SetNX("foo", "exists!")
-
-	if err != nil {
-		t.Fatalf("Command failed: %s", err.Error())
+	if b, err = client.SetNX("foo", "exists!"); err != nil {
+		t.Fatalf("Command SETNX failed: %q", err)
 	}
 
 	if b == true {
-		t.Fatalf("Failed")
+		t.Fatal()
 	}
 }
 
 func TestGet(t *testing.T) {
 	var s string
 	var err error
+	var client *Client
 
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatal("Client failed to connect: ", err)
+	}
+
+	defer client.Close()
+
+	// Setting the FOO key.
 	client.Set("foo", "hello")
 
-	s, err = client.Get("foo")
-	if err != nil {
-		t.Fatalf("Command failed: %s", err.Error())
+	// Getting the FOO key.
+	if s, err = client.Get("foo"); err != nil {
+		t.Fatalf("Command GET failed: %q", err)
 	}
 
 	if s != "hello" {
-		t.Errorf("Could not SET/GET value.")
+		t.Fatalf("Could not SET/GET value.")
 	}
 
 	// Deleting key.
@@ -155,8 +148,9 @@ func TestGet(t *testing.T) {
 	if s != "" {
 		t.Fatalf("Expecting an empty string.")
 	}
+
 	if err != ErrNilReply {
-		t.Fatalf("Expecting a redis.ErrNilReply error.")
+		t.Fatalf("Expecting a redis.ErrNilReply error, got %q.", err)
 	}
 
 	// Making sure https://github.com/gosexy/redis/issues/23 does not interfere
@@ -169,7 +163,7 @@ func TestGet(t *testing.T) {
 	vals, err = client.HMGet("test", "1232", "456")
 
 	if err != nil {
-		t.Fatalf("Expecting no error.")
+		t.Fatal(err)
 	}
 
 	if vals[0] != "" || vals[1] != "*" {
@@ -181,32 +175,52 @@ func TestGet(t *testing.T) {
 func TestSetGetUnicode(t *testing.T) {
 	var r string
 	var err error
+	var client *Client
 
-	r, err = client.Set("heart", "♥")
-	if err != nil {
-		t.Fatalf("Command failed: %s", err.Error())
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatal(err)
 	}
 
-	r, err = client.Get("heart")
-	if err != nil {
-		t.Fatalf("Command failed: %s", err.Error())
+	defer client.Close()
+
+	if r, err = client.Set("heart", "♥"); err != nil {
+		t.Fatalf("Command failed: %q", err)
+	}
+
+	if r != "OK" {
+		t.Fatalf("Could not SET binary value.")
+	}
+
+	if r, err = client.Get("heart"); err != nil {
+		t.Fatalf("Command failed: %q", err)
 	}
 
 	if r != "♥" {
-		t.Errorf("Could not SET/GET binary value.")
+		t.Fatalf("Could not GET binary value.")
 	}
 }
 
 func TestDel(t *testing.T) {
 	var i int64
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatal(err)
+	}
+
+	defer client.Close()
 
 	client.Set("counter", 0)
 
 	i, err = client.Del("counter")
 
 	if err != nil {
-		t.Fatalf("Command failed: %s", err.Error())
+		t.Fatal(err)
 	}
 
 	if i != 1 {
@@ -216,7 +230,7 @@ func TestDel(t *testing.T) {
 	i, err = client.Del("counter")
 
 	if err != nil {
-		t.Fatalf("Command failed: %s", err.Error())
+		t.Fatal(err)
 	}
 
 	if i != 0 {
@@ -227,11 +241,18 @@ func TestDel(t *testing.T) {
 func TestList(t *testing.T) {
 	var items []string
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err = client.Del("list")
 
 	if err != nil {
-		t.Fatalf("Command failed: %s", err.Error())
+		t.Fatalf("Command failed: %q", err)
 	}
 
 	for i := 0; i < 10; i++ {
@@ -258,6 +279,13 @@ func TestAppendGetRange(t *testing.T) {
 	var s string
 	var b bool
 	var i int64
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err = client.Del("mykey")
 
@@ -347,6 +375,13 @@ func TestAppendGetRange(t *testing.T) {
 func TestBitCount(t *testing.T) {
 	var err error
 	var i int64
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err = client.Set("mykey", "foobar")
 
@@ -378,6 +413,15 @@ func TestIncrDecr(t *testing.T) {
 	var i int64
 	var err error
 	var s string
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatal(err)
+	}
+
+	defer client.Close()
 
 	// -> 0
 	client.Set("counter", 0)
@@ -453,6 +497,15 @@ func TestDump(t *testing.T) {
 	var ls []string
 	var i int64
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatal(err)
+	}
+
+	defer client.Close()
 
 	// Deleting key
 	client.Del("mykey")
@@ -540,6 +593,15 @@ func TestExpire(t *testing.T) {
 	var i int64
 	var s string
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	// Setting key
 	client.Set("mykey", "Hello")
@@ -712,6 +774,15 @@ func TestSet(t *testing.T) {
 	var s string
 	var ls []string
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	// Deleting
 	client.Del("myset")
@@ -884,6 +955,15 @@ func TestZSet(t *testing.T) {
 	var s string
 	var ls []string
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	// Deleting
 	client.Del("myset")
@@ -1095,41 +1175,16 @@ func TestZSet(t *testing.T) {
 
 }
 
-func TestPublish(t *testing.T) {
-	var err error
-
-	publisher := New()
-
-	err = publisher.Connect(testHost, testPort)
-
-	if err != nil {
-		t.Fatalf("Connect failed: %v", err)
-	}
-
-	// Publishing
-	for i := 0; i < 200; i++ {
-		_, err = publisher.Publish("channel", i)
-		if err != nil {
-			t.Fatalf("Error: %s", err.Error())
-		}
-	}
-
-	publisher.Quit()
-}
-
-func TestSubscriptions(t *testing.T) {
+func TestSubscribe(t *testing.T) {
 	var ls []string
-
 	var err error
+
+	ok := make(chan bool)
 
 	consumer := New()
 
-	err = consumer.ConnectNonBlock(testHost, testPort)
-
-	consumer.Set("test", "TestSubscriptions")
-
-	if err != nil {
-		t.Fatalf("Connect failed: %v", err)
+	if err = consumer.Connect(testHost, testPort); err != nil {
+		t.Fatal("Failed to connect: ", err)
 	}
 
 	rec := make(chan []string)
@@ -1138,51 +1193,258 @@ func TestSubscriptions(t *testing.T) {
 		select {
 		case ls = <-rec:
 			t.Logf("Got: %v\n", ls)
+			ok <- true
+			return
 		}
 	}()
 
-	go consumer.Subscribe(rec, "channel")
+	if err = consumer.Subscribe(rec, "channel"); err != nil {
+		t.Fatal("Failed to subscribe: ", err)
+	}
+
+	<-ok
 
 	consumer.Unsubscribe("channel")
 
 	consumer.Quit()
 }
 
-func TestPSubscriptions(t *testing.T) {
-	var ls []string
-
+func TestPublishAndSubscribe(t *testing.T) {
 	var err error
+	var received map[int]bool
+	var tests int
+
+	wg := new(sync.WaitGroup)
+
+	mu := new(sync.Mutex)
+
+	tests = 10
+
+	// Subscriber
+	consumer := New()
+
+	if err = consumer.Connect(testHost, testPort); err != nil {
+		t.Fatal("Failed to connect: ", err)
+	}
+
+	rec := make(chan []string, tests)
+
+	subscribed := make(chan bool)
+
+	go func() {
+		received = make(map[int]bool)
+		for {
+			// Receiving messages.
+			select {
+			case ls := <-rec:
+				if ls[0] == `message` {
+					i, _ := strconv.Atoi(ls[2])
+					received[i] = true
+					// Marking job as done.
+					wg.Done()
+				} else if ls[0] == `subscribe` {
+					subscribed <- true
+				} else if ls[0] == `unsubscribe` {
+					return
+				}
+			}
+		}
+	}()
+
+	if err = consumer.Subscribe(rec, "channel"); err != nil {
+		t.Fatal("Subscribe() ", err)
+	}
+
+	// Waiting for subscription to happen.
+	<-subscribed
+
+	// Publisher
+	publisher := New()
+
+	if err = publisher.Connect(testHost, testPort); err != nil {
+		t.Fatal("Failed to connect: ", err)
+	}
+
+	// Publishing
+	var clients int64
+	for i := 0; i < tests; i++ {
+		mu.Lock()
+		wg.Add(1)
+		clients, err = publisher.Publish("channel", i)
+		if err != nil {
+			t.Fatal("Publish(): ", err)
+		}
+		if clients < 1 {
+			t.Fatal("We should have at least one subscribed client.")
+		}
+		mu.Unlock()
+	}
+
+	// Waiting jobs to finish.
+	wg.Wait()
+
+	if _, err = publisher.Quit(); err != nil {
+		t.Fatal("Quit(): ", err)
+	}
+
+	if err = consumer.Unsubscribe("channel"); err != nil {
+		t.Fatal("Unsubscribe(): ", err)
+	}
+
+	if _, err = consumer.Quit(); err != nil {
+		t.Fatal("Quit(): ", err)
+	}
+
+	// Verifying data map.
+	for i := 0; i < tests; i++ {
+		if received[i] == false {
+			t.Fatal(`The "test" map should be populated with true values.`)
+		}
+	}
+}
+
+func TestPSubscribe(t *testing.T) {
+	var ls []string
+	var err error
+
+	ok := make(chan bool)
 
 	consumer := New()
 
-	err = consumer.ConnectNonBlock(testHost, testPort)
-
-	if err != nil {
-		t.Fatalf("Connect failed: %v", err)
+	if err = consumer.Connect(testHost, testPort); err != nil {
+		t.Fatal("Failed to connect: ", err)
 	}
-
-	consumer.Set("test", "TestPSubscriptions")
 
 	rec := make(chan []string)
 
 	go func() {
 		select {
 		case ls = <-rec:
-			t.Logf("Got: %v (%d)\n", ls)
+			t.Logf("Got: %v\n", ls)
+			ok <- true
+			return
 		}
 	}()
 
-	go consumer.PSubscribe(rec, "channel")
+	if err = consumer.PSubscribe(rec, "channel"); err != nil {
+		t.Fatal("Failed to subscribe: ", err)
+	}
+
+	<-ok
 
 	consumer.PUnsubscribe("channel")
 
 	consumer.Quit()
 }
 
+func TestPublishAndPSubscribe(t *testing.T) {
+	var err error
+	var received map[int]bool
+	var tests int
+
+	wg := new(sync.WaitGroup)
+
+	mu := new(sync.Mutex)
+
+	tests = 10
+
+	// Subscriber
+	consumer := New()
+
+	if err = consumer.Connect(testHost, testPort); err != nil {
+		t.Fatal("Failed to connect: ", err)
+	}
+
+	rec := make(chan []string, tests)
+
+	psubscribed := make(chan bool)
+
+	go func() {
+		received = make(map[int]bool)
+		for {
+			// Receiving messages.
+			select {
+			case ls := <-rec:
+				if ls[0] == `pmessage` {
+					i, _ := strconv.Atoi(ls[3])
+					received[i] = true
+					// Marking job as done.
+					wg.Done()
+				} else if ls[0] == `psubscribe` {
+					psubscribed <- true
+				} else if ls[0] == `punsubscribe` {
+					return
+				}
+			}
+		}
+	}()
+
+	if err = consumer.PSubscribe(rec, "channe?"); err != nil {
+		t.Fatal("Subscribe() ", err)
+	}
+
+	// Waiting for subscription to happen.
+	<-psubscribed
+
+	// Publisher
+	publisher := New()
+
+	if err = publisher.Connect(testHost, testPort); err != nil {
+		t.Fatal("Failed to connect: ", err)
+	}
+
+	// Publishing
+	var clients int64
+	for i := 0; i < tests; i++ {
+		mu.Lock()
+		wg.Add(1)
+		clients, err = publisher.Publish("channel", i)
+		if err != nil {
+			t.Fatal("Publish(): ", err)
+		}
+		if clients < 1 {
+			t.Fatal("We should have at least one subscribed client.")
+		}
+		mu.Unlock()
+	}
+
+	// Waiting jobs to finish.
+	wg.Wait()
+
+	if _, err = publisher.Quit(); err != nil {
+		t.Fatal("Quit(): ", err)
+	}
+
+	if err = consumer.PUnsubscribe("channel"); err != nil {
+		t.Fatal("PUnsubscribe(): ", err)
+	}
+
+	if _, err = consumer.Quit(); err != nil {
+		t.Fatal("Quit(): ", err)
+	}
+
+	// Verifying data map.
+	for i := 0; i < tests; i++ {
+		if received[i] == false {
+			t.Fatal(`The "test" map should be populated with true values.`)
+		}
+	}
+}
+
+/*
 func TestTransactions(t *testing.T) {
 	var ls []interface{}
 	var err error
 	var s string
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	client.Del("mykey")
 
@@ -1216,11 +1478,21 @@ func TestTransactions(t *testing.T) {
 	}
 
 }
+*/
 
 func TestEval(t *testing.T) {
 	var ls []string
 	var h string
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	ls, err = client.Eval("return {KEYS[1],KEYS[2],ARGV[1],ARGV[2]}", 2, "key1", "key2", "first", "second")
 
@@ -1263,6 +1535,15 @@ func TestEval(t *testing.T) {
 func TestRandom(t *testing.T) {
 	var s string
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	// Getting a random key
 	s, err = client.RandomKey()
@@ -1280,6 +1561,15 @@ func TestRename(t *testing.T) {
 	var s string
 	var b bool
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	// Setting key
 	client.Set("mykey", "Hello")
@@ -1325,6 +1615,15 @@ func TestRename(t *testing.T) {
 func TestSort(t *testing.T) {
 	var el []string
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	// Deleting key
 	client.Del("mylist")
@@ -1357,6 +1656,15 @@ func TestObject(t *testing.T) {
 	var s string
 	var i int64
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	client.Del("mylist")
 
@@ -1396,6 +1704,15 @@ func TestKeys(t *testing.T) {
 	var k []string
 	var s string
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	// Multiple set
 	s, err = client.MSet(
@@ -1486,6 +1803,15 @@ func TestRange(t *testing.T) {
 	var i int64
 	var s string
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	// Setting key
 	client.Set("key1", "Hello World")
@@ -1525,6 +1851,15 @@ func TextHashes(t *testing.T) {
 	var s string
 	var ls []string
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	// Deleting hash
 	client.Del("myhash")
@@ -1673,6 +2008,15 @@ func TestLists(t *testing.T) {
 	var s string
 	var i int64
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	// Deleting lists
 	client.Del("list1", "list2")
@@ -1891,6 +2235,15 @@ func TestLists(t *testing.T) {
 func TestSetBit(t *testing.T) {
 	var err error
 	var i int64
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	client.Del("mykey")
 
@@ -1925,6 +2278,15 @@ func TestBitOp(t *testing.T) {
 	var err error
 	var s string
 	var i int64
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	client.Set("key1", "foobar")
 	client.Set("key2", "foobax")
@@ -1952,11 +2314,22 @@ func TestRawList(t *testing.T) {
 	var items []int
 	var sitems []string
 	var err error
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 
 	err = client.Command(nil, "DEL", "list")
 
 	if err != nil {
-		t.Fatalf("Command failed: %s", err.Error())
+		if err != ErrNilReply {
+			t.Fatalf("Command failed: %s", err.Error())
+		}
 	}
 
 	for i := 0; i < 10; i++ {
@@ -1964,8 +2337,8 @@ func TestRawList(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Command failed: %s", err.Error())
 		}
-		if r == 0 {
-			t.Fatalf("Failed")
+		if r != i+1 {
+			t.Fatalf("Failed, expecting %d, got %d", i+1, r)
 		}
 	}
 
@@ -1992,7 +2365,18 @@ func TestRawList(t *testing.T) {
 }
 
 // https://github.com/gosexy/redis/issues/27
-func TestInfo(t *testing.T) {
+func Test_Issue27(t *testing.T) {
+	var client *Client
+	var err error
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
+
 	info, err := client.Info("all")
 
 	if err != nil {
@@ -2004,19 +2388,62 @@ func TestInfo(t *testing.T) {
 	}
 }
 
-func TestQuit(t *testing.T) {
+// See https://github.com/gosexy/redis/issues/38
+func Test_Issue38(t *testing.T) {
+	var client *Client
 	var err error
 
-	_, err = client.Quit()
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	client.Del("mylist")
+	client.Set("mylist", 1)
+
+	defer client.Close()
+
+	if _, err = client.RPush("mylist", 1); err == nil {
+		t.Fatalf("Expecting an error.")
+	}
+
+	if !strings.Contains(err.Error(), "WRONGTYPE") {
+		t.Fatalf("Expecting WRONGTYPE error.")
+	}
+}
+
+func TestQuit(t *testing.T) {
+	var err error
+	var s string
+	var client *Client
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		t.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
+
+	s, err = client.Quit()
 
 	if err != nil {
 		t.Fatalf("Failed")
 	}
 
-	_, err = client.Quit()
+	if s != "OK" {
+		t.Fatal()
+	}
+
+	s, err = client.Quit()
 
 	if err == nil {
 		t.Fatalf("Did not fail.")
+	}
+
+	if s == "OK" {
+		t.Fatal()
 	}
 
 	_, err = client.Set("foo", 1)
@@ -2027,10 +2454,19 @@ func TestQuit(t *testing.T) {
 }
 
 func BenchmarkConnect(b *testing.B) {
+	var client *Client
+	var err error
+
 	client = New()
 
-	err := client.ConnectWithTimeout(testHost, testPort, time.Second*1)
-	//err := client.ConnectNonBlock(testHost, testPort)
+	if err = client.Connect(testHost, testPort); err != nil {
+		b.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
+
+	err = client.ConnectWithTimeout(testHost, testPort, time.Second*1)
+	//err := client.Connect(testHost, testPort)
 
 	if err != nil {
 		b.Fatalf(err.Error())
@@ -2038,19 +2474,37 @@ func BenchmarkConnect(b *testing.B) {
 }
 
 func BenchmarkPing(b *testing.B) {
+	var client *Client
 	var err error
-	client.Del("hello")
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		b.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
+
 	for i := 0; i < b.N; i++ {
 		_, err = client.Ping()
 		if err != nil {
-			b.Fatalf(err.Error())
+			b.Fatal(err)
 			break
 		}
 	}
 }
 
 func BenchmarkSet(b *testing.B) {
+	var client *Client
 	var err error
+
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		b.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
+	client.Del("hello")
 	for i := 0; i < b.N; i++ {
 		_, err = client.Set("hello", 1)
 		if err != nil {
@@ -2061,7 +2515,15 @@ func BenchmarkSet(b *testing.B) {
 }
 
 func BenchmarkGet(b *testing.B) {
+	var client *Client
 	var err error
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		b.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 	for i := 0; i < b.N; i++ {
 		_, err = client.Get("hello")
 		if err != nil {
@@ -2072,7 +2534,15 @@ func BenchmarkGet(b *testing.B) {
 }
 
 func BenchmarkIncr(b *testing.B) {
+	var client *Client
 	var err error
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		b.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 	for i := 0; i < b.N; i++ {
 		_, err = client.Incr("hello")
 		if err != nil {
@@ -2083,7 +2553,15 @@ func BenchmarkIncr(b *testing.B) {
 }
 
 func BenchmarkLPush(b *testing.B) {
+	var client *Client
 	var err error
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		b.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 	client.Del("hello")
 	for i := 0; i < b.N; i++ {
 		_, err = client.LPush("hello", i)
@@ -2095,7 +2573,15 @@ func BenchmarkLPush(b *testing.B) {
 }
 
 func BenchmarkLRange10(b *testing.B) {
+	var client *Client
 	var err error
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		b.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 	for i := 0; i < b.N; i++ {
 		_, err = client.LRange("hello", 0, 10)
 		if err != nil {
@@ -2106,7 +2592,15 @@ func BenchmarkLRange10(b *testing.B) {
 }
 
 func BenchmarkLRange100(b *testing.B) {
+	var client *Client
 	var err error
+	client = New()
+
+	if err = client.Connect(testHost, testPort); err != nil {
+		b.Fatalf("Client failed to connect to an up-and-running redis server: %q", err)
+	}
+
+	defer client.Close()
 	for i := 0; i < b.N; i++ {
 		_, err = client.LRange("hello", 0, 100)
 		if err != nil {
